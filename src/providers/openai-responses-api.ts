@@ -9,6 +9,7 @@
  * exposes the response's ordered output array verbatim for the next turn.
  */
 
+import { createHash, randomUUID } from 'node:crypto';
 import { normalizeResponsesInput } from './responses-input.js';
 import { fetchWithCredentials, type CredentialResolver } from './credentials.js';
 
@@ -126,6 +127,16 @@ export interface OpenAIResponsesAPIAdapterConfig {
   fastMode?: boolean;
   /** Called once if a subscription response reports a non-priority tier. */
   onFastModeFallback?: (serviceTier: string) => void;
+  /** Subscription mode: base of the prompt-cache routing id sent as the
+   * `session_id` header and as `prompt_cache_key`. Each request appends a digest
+   * of its instructions and first input item, which groups requests by
+   * serialized head: requests that share a head share an id (and a prefix, so
+   * that is the right grouping), tools and later items are not considered.
+   * Streams that need isolation beyond that (same-head forks or subagents on
+   * one adapter) should set `extra.prompt_cache_key`, which is used instead.
+   * Defaults to a random id held for the adapter's lifetime, so a restart
+   * pays one uncached read per head; pin it to survive restarts. */
+  sessionId?: string;
   /** API base URL (defaults to the selected mode's endpoint). */
   baseURL?: string;
   /** Optional OpenAI organization ID. */
@@ -136,6 +147,14 @@ export interface OpenAIResponsesAPIAdapterConfig {
   defaultMaxTokens?: number;
   /** Additional HTTP headers. */
   extraHeaders?: Record<string, string>;
+}
+
+/** A cache key is any JSON string, a header value is not: anything beyond
+ * short visible ASCII is sent as a digest, which is just as stable. */
+function headerSafeSessionId(key: string): string {
+  return /^[\x21-\x7e]{1,128}$/.test(key)
+    ? key
+    : createHash('sha256').update(key).digest('hex').slice(0, 32);
 }
 
 // ============================================================================
@@ -162,6 +181,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
   private fastMode: boolean;
   private readonly onFastModeFallback?: (serviceTier: string) => void;
   private warnedFastFallback = false;
+  private readonly sessionId: string;
   private readonly baseURL: string;
   private readonly organization?: string;
   private readonly project?: string;
@@ -177,6 +197,7 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     }
     this.fastMode = config.fastMode ?? false;
     this.onFastModeFallback = config.onFastModeFallback;
+    this.sessionId = config.sessionId ?? randomUUID();
     this.apiKey = config.apiKey ?? process.env.OPENAI_API_KEY ?? '';
     this.baseURL = (config.baseURL ?? (this.subscription ? 'https://chatgpt.com/backend-api/codex' : 'https://api.openai.com/v1')).replace(/\/$/, '');
     this.organization = config.organization;
@@ -360,16 +381,27 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
     request: OpenAIResponsesAPIRequest,
     signal?: AbortSignal,
   ): Promise<Response> {
+    // Built with set() because header names are case-insensitive: spreading into
+    // an object lets `Session_Id` in extraHeaders coexist with the computed
+    // `session_id`, and Headers then joins the two into one comma-separated value.
+    const headers = new Headers({ 'Content-Type': 'application/json' });
+    if (this.organization) headers.set('OpenAI-Organization', this.organization);
+    if (this.project) headers.set('OpenAI-Project', this.project);
+    if (this.subscription) {
+      // The subscription backend keys its prompt cache on this header and
+      // ignores the body's prompt_cache_key: without it every response gets a
+      // fresh random key and a byte-stable prefix still reads cached_tokens 0
+      // (probed live 2026-09-21: 0 of 9.2k without, 9088 of 9256 with). Warm
+      // calls still miss sporadically whatever the id: 3 of 28 on a dedicated
+      // id, 3 of 13 on one shared by two interleaved prefixes.
+      headers.set('session_id', headerSafeSessionId(String(request.prompt_cache_key)));
+    }
+    for (const [name, value] of Object.entries(this.extraHeaders)) headers.set(name, value);
     return fetchWithCredentials(`${this.baseURL}/responses`, {
       method: 'POST',
       body: JSON.stringify(request),
       signal,
-      headers: {
-        'Content-Type': 'application/json',
-        ...(this.organization ? { 'OpenAI-Organization': this.organization } : {}),
-        ...(this.project ? { 'OpenAI-Project': this.project } : {}),
-        ...this.extraHeaders,
-      },
+      headers,
     }, this.credentials ?? { token: this.apiKey });
   }
 
@@ -426,6 +458,14 @@ export class OpenAIResponsesAPIAdapter implements ProviderAdapter {
       }
       if (this.fastMode) responsesRequest.service_tier = 'priority';
       else delete responsesRequest.service_tier;
+      if (typeof responsesRequest.prompt_cache_key !== 'string' || !responsesRequest.prompt_cache_key) {
+        const head = createHash('sha256')
+          .update(this.sessionId)
+          .update(JSON.stringify([responsesRequest.instructions ?? '', responsesRequest.input[0] ?? null]))
+          .digest('hex')
+          .slice(0, 12);
+        responsesRequest.prompt_cache_key = `${this.sessionId}:${head}`;
+      }
     }
     return responsesRequest;
   }

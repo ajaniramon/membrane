@@ -47,6 +47,103 @@ function completedResponse(): Response {
 }
 
 describe('OpenAI Responses subscription mode', () => {
+  test('sends a stable session_id per logical stream so the backend prompt cache can hit', async () => {
+    const seen: Array<{ header: string | null; key: unknown }> = [];
+    globalThis.fetch = async (_input, init) => {
+      seen.push({
+        header: new Headers(init?.headers).get('session_id'),
+        key: JSON.parse(String(init?.body)).prompt_cache_key,
+      });
+      return completedResponse();
+    };
+    const credentials: CredentialResolver = async () => ({ token: 'subscription-token' });
+    const adapter = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials });
+
+    const grown = request();
+    grown.messages = [...grown.messages, { type: 'message', role: 'user', content: 'A later turn' }];
+    const otherStream = request();
+    otherStream.messages = [{ type: 'message', role: 'user', content: 'A different conversation head' }];
+    const sameHeadOtherTools = { ...request(), tools: [{ name: 'noop', description: 'noop', inputSchema: { type: 'object' } }] };
+
+    await adapter.complete(request());
+    await adapter.stream(grown, { onChunk: () => {} });
+    await adapter.complete(otherStream);
+    await adapter.complete(request({ prompt_cache_key: 'agent:devops' }));
+    await adapter.complete(sameHeadOtherTools as ProviderRequest);
+
+    expect(seen[0].header).toMatch(/^[0-9a-f-]{36}:[0-9a-f]{12}$/);
+    expect(seen[0].key).toBe(seen[0].header);
+    // Grouping is by serialized head: appended turns and a different tool list keep
+    // the id, a different first item gets its own.
+    expect(seen[4].header).toBe(seen[0].header);
+    expect(seen[1].header).toBe(seen[0].header);
+    expect(seen[2].header).not.toBe(seen[0].header);
+    expect(seen[2].header!.slice(0, 36)).toBe(seen[0].header!.slice(0, 36));
+    expect(seen[3]).toEqual({ header: 'agent:devops', key: 'agent:devops' });
+
+    const pinned = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials, sessionId: 'pinned' });
+    await pinned.complete(request());
+    expect(seen[5].header).toMatch(/^pinned:[0-9a-f]{12}$/);
+    // The digest is salted with the base id, so it is not a bare content fingerprint.
+    expect(seen[5].header!.slice(-12)).not.toBe(seen[0].header!.slice(-12));
+  });
+
+  test('extraHeaders overrides the computed session_id in any casing, without joining', async () => {
+    const seen: Array<string | null> = [];
+    globalThis.fetch = async (_input, init) => {
+      seen.push(new Headers(init?.headers).get('session_id'));
+      return completedResponse();
+    };
+    const credentials: CredentialResolver = async () => ({ token: 'subscription-token' });
+    for (const name of ['session_id', 'Session_Id']) {
+      const adapter = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials, extraHeaders: { [name]: 'fixed' } });
+      await adapter.complete(request());
+    }
+    expect(seen).toEqual(['fixed', 'fixed']);
+  });
+
+  test('a cache key that is not a valid header value is sent as a stable digest', async () => {
+    const seen: Array<{ header: string | null; key: unknown }> = [];
+    globalThis.fetch = async (_input, init) => {
+      seen.push({
+        header: new Headers(init?.headers).get('session_id'),
+        key: JSON.parse(String(init?.body)).prompt_cache_key,
+      });
+      return completedResponse();
+    };
+    const credentials: CredentialResolver = async () => ({ token: 'subscription-token' });
+    const adapter = new OpenAIResponsesAPIAdapter({ mode: 'subscription', credentials, sessionId: 'агент\n1' });
+
+    for (const key of ['line\nbreak', 'ключ', 'x'.repeat(500)]) {
+      await adapter.complete(request({ prompt_cache_key: key }));
+      await adapter.complete(request({ prompt_cache_key: key }));
+      const [first, second] = seen.slice(-2);
+      expect(first.key).toBe(key);
+      expect(first.header).toMatch(/^[0-9a-f]{32}$/);
+      expect(second.header).toBe(first.header);
+    }
+    await adapter.complete(request());
+    expect(seen.at(-1)!.header).toMatch(/^[0-9a-f]{32}$/);
+    expect(new Set(seen.map((entry) => entry.header)).size).toBe(4);
+  });
+
+  test('api mode sends no session_id and leaves prompt_cache_key to the caller', async () => {
+    let header: string | null = 'unset';
+    let key: unknown = 'unset';
+    globalThis.fetch = async (_input, init) => {
+      header = new Headers(init?.headers).get('session_id');
+      key = JSON.parse(String(init?.body)).prompt_cache_key;
+      return new Response(JSON.stringify({
+        id: 'resp_test', model: 'gpt-5.4', status: 'completed', output: [],
+        usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
+      }), { headers: { 'Content-Type': 'application/json' } });
+    };
+    const adapter = new OpenAIResponsesAPIAdapter({ apiKey: 'sk-test' });
+    await adapter.complete(request());
+    expect(header).toBeNull();
+    expect(key).toBeUndefined();
+  });
+
   test('uses the subscription endpoint and enables Fast mode per request', async () => {
     const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
     globalThis.fetch = async (input, init) => {

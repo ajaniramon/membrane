@@ -51,7 +51,18 @@ interface OpenAIMessage {
    *  channel from `content`). Captured into a thinking block, and re-sent on
    *  prior assistant turns to preserve chain-of-thought. */
   reasoning?: string;
+  /** Same trace under the DeepSeek spelling, used e.g. by Xiaomi's official
+   *  MiMo API in both messages and stream deltas. Read as an alias of
+   *  `reasoning`; `reasoning` wins when a backend sends both. */
+  reasoning_content?: string;
   reasoning_details?: unknown;
+}
+
+/** The reasoning trace of a message or stream delta, under either spelling. */
+function reasoningOf(m: { reasoning?: unknown; reasoning_content?: unknown } | undefined): string | undefined {
+  if (typeof m?.reasoning === 'string' && m.reasoning) return m.reasoning;
+  if (typeof m?.reasoning_content === 'string') return m.reasoning_content;
+  return undefined;
 }
 
 /**
@@ -242,9 +253,11 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
             callbacks.onChunk(delta.content);
           }
 
-          // Reasoning-model trace arrives on its own channel (not `content`).
-          if (typeof delta?.reasoning === 'string') {
-            reasoning += delta.reasoning;
+          // Reasoning-model trace arrives on its own channel (not `content`),
+          // as `reasoning` or `reasoning_content` depending on the backend.
+          const reasoningDelta = reasoningOf(delta);
+          if (reasoningDelta !== undefined) {
+            reasoning += reasoningDelta;
           }
 
           // Handle streaming tool calls
@@ -593,7 +606,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     const content: ContentBlock[] = [];
 
     // Reasoning trace first (mirrors Anthropic thinking-block ordering).
-    const reasoning = (message as OpenAIMessage).reasoning;
+    const reasoning = reasoningOf(message);
     if (typeof reasoning === 'string' && reasoning.trim()) {
       content.push({ type: 'thinking', thinking: reasoning } as ContentBlock);
     }
@@ -756,7 +769,7 @@ export function toOpenAIMessages(
 export function fromOpenAIMessage(message: OpenAIMessage): ContentBlock[] {
   const result: ContentBlock[] = [];
 
-  const reasoning = message.reasoning;
+  const reasoning = reasoningOf(message);
   if (typeof reasoning === 'string' && reasoning.trim()) {
     result.push({ type: 'thinking', thinking: reasoning } as ContentBlock);
   }

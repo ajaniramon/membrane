@@ -53,6 +53,13 @@ describe('OpenAICompatibleAdapter reasoning_content (non-streamed)', () => {
     expect(thinkingOf(res.content)).toEqual(['zz primary']);
   });
 
+  it('falls back to reasoning_content when reasoning is whitespace-only', async () => {
+    stubFetchWithJson(completion({ content: 'zz answer', reasoning: ' \n ', reasoning_content: 'zz real trace' }));
+    const res: any = await adapter().complete(chatRequest as any);
+
+    expect(thinkingOf(res.content)).toEqual(['zz real trace']);
+  });
+
   it('keeps tool calls alongside a reasoning_content trace', async () => {
     stubFetchWithJson(completion({
       content: '',
@@ -81,6 +88,23 @@ describe('OpenAICompatibleAdapter reasoning_content (streamed)', () => {
     expect(res.content[1]).toEqual({ type: 'text', text: 'zz answer' });
     // The trace never leaks into the visible text channel.
     expect(chunks.join('')).toBe('zz answer');
+  });
+
+  it('keeps whitespace-only deltas that are part of the trace', async () => {
+    // A streamed trace is split at token boundaries: a lone ' ' or '\n' delta is
+    // real content. Trimming per delta would glue the words together.
+    stubFetchWithSseLines([
+      '{"choices":[{"delta":{"reasoning_content":"zz step one,"}}]}',
+      '{"choices":[{"delta":{"reasoning_content":" "}}]}',
+      '{"choices":[{"delta":{"reasoning_content":"two"}}]}',
+      '{"choices":[{"delta":{"reasoning":"\\n"}}]}',
+      '{"choices":[{"delta":{"reasoning":"three"}}]}',
+      '{"choices":[{"delta":{"content":"zz answer"},"finish_reason":"stop"}]}',
+      '[DONE]',
+    ]);
+    const res: any = await adapter().stream(chatRequest as any, { onChunk: () => {} } as any);
+
+    expect(thinkingOf(res.content)).toEqual(['zz step one, two\nthree']);
   });
 
   it('does not double-count a delta that carries both spellings', async () => {

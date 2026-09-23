@@ -58,11 +58,17 @@ interface OpenAIMessage {
   reasoning_details?: unknown;
 }
 
-/** The reasoning trace of a message or stream delta, under either spelling. */
+/**
+ * The reasoning trace of a message or stream delta, under either spelling.
+ * `reasoning` wins unless it is blank while `reasoning_content` has substance —
+ * a whitespace-only `reasoning` must not hide the real trace. Whitespace is not
+ * trimmed away otherwise: a lone ' ' or '\n' stream delta is part of the trace.
+ */
 function reasoningOf(m: { reasoning?: unknown; reasoning_content?: unknown } | undefined): string | undefined {
-  if (typeof m?.reasoning === 'string' && m.reasoning) return m.reasoning;
-  if (typeof m?.reasoning_content === 'string') return m.reasoning_content;
-  return undefined;
+  const reasoning = typeof m?.reasoning === 'string' ? m.reasoning : undefined;
+  const alias = typeof m?.reasoning_content === 'string' ? m.reasoning_content : undefined;
+  if (reasoning && (reasoning.trim() || !alias?.trim())) return reasoning;
+  return alias ?? reasoning;
 }
 
 /**
